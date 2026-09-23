@@ -657,6 +657,83 @@ class LigationAssemblyResponse(BaseModel):
     stop_reason_detail: str
 
 
+# ---------- PCR 扩增产物预测 ----------
+
+
+class PcrProductsRequest(BaseModel):
+    """PCR 扩增产物预测请求：两条 IUPAC 引物（5'->3'）+ 最大产物长度。
+
+    纯只读计算，读取已保存记录的原始序列与拓扑，不引用酶切片段、不写库。
+    两条引物至少各 2 个碱基（3' 端最后两位强制匹配，单碱基引物无从谈起）；
+    ``max_product_length`` 为正整数且不得超过模板长度——上界依赖已保存
+    记录的序列长度，越界检查在路由中（取到记录之后）完成，以 422 拒绝。
+    引物长于模板时不产生位点，结果为空数组（并非非法请求）。
+    """
+
+    forward_primer: str = Field(
+        description="正引物序列（5'->3'），沿模板正向匹配", examples=["ATGCGAT"]
+    )
+    reverse_primer: str = Field(
+        description="反引物序列（5'->3'），以反向互补序列在模板上匹配",
+        examples=["TTCGCGC"],
+    )
+    max_product_length: int = Field(
+        ge=1, description="最大产物长度（含），不得超过模板长度", examples=[1000]
+    )
+
+    @field_validator("forward_primer", "reverse_primer")
+    @classmethod
+    def _primer_ok(cls, v: str) -> str:
+        seq = _check_iupac(v, "primer")
+        # 在去除空白后的规范序列上检查长度，使 " A" 这类输入同样被拒绝
+        if len(seq) < 2:
+            raise ValueError("primer must contain at least 2 IUPAC bases")
+        return seq
+
+
+class PcrBindingOut(BaseModel):
+    """一条引物的结合信息：top 链 0-based 半开区间 ``[start, end)`` 与错配数。
+
+    反引物的坐标同样给出其反向互补序列在 top 链上的结合区；环形结合区
+    跨原点时 ``end`` 为取模后的坐标（可能小于 ``start``）。``mismatches``
+    恒为 0 或 1（3' 端最后两位不计入错配——该位置不兼容的位点不会被枚举）。
+    """
+
+    start: int
+    end: int
+    mismatches: int
+
+
+class PcrProductOut(BaseModel):
+    """一个 PCR 产物：top 链 5'->3' 序列、两端结合坐标、长度、各自错配数。
+
+    ``start`` / ``end`` 为产物在 top 链上的 0-based 半开区间端点；环形产物
+    跨原点时 ``end`` 为取模后的坐标（可能小于 ``start``）且
+    ``wraps_origin`` 为 true。
+    """
+
+    sequence: str
+    start: int
+    end: int
+    length: int
+    wraps_origin: bool
+    forward_binding: PcrBindingOut
+    reverse_binding: PcrBindingOut
+
+
+class PcrProductsResponse(BaseModel):
+    """PCR 产物预测结果：产物按（起点、长度）升序排列，无产物时为空数组。"""
+
+    id: int
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    forward_primer: str
+    reverse_primer: str
+    max_product_length: int
+    product_count: int
+    products: list[PcrProductOut]
+
+
 # ---------- 固定窗口 GC 含量范围 ----------
 
 

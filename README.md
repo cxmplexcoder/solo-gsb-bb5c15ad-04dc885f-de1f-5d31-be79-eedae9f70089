@@ -70,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
 | `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/methylation-analysis` | 只读分析甲基化对已保存酶切位点的阻断影响：按酶的敏感偏移定位甲基化碱基，阻断/保留/移除切口并重建片段（不落库，记录不存在返回 404） |
+| `POST` | `/digests/{id}/pcr-products` | 只读预测 PCR 扩增产物：读取已保存记录的原始序列与拓扑（不依赖酶切片段），按 IUPAC 集合交集匹配正/反引物（各允许一处错配、3' 端最后两位强制匹配），枚举相向且结合区不重叠的位点对，线性不越界、环形可跨原点但不超过一圈，返回产物序列、结合坐标、长度、错配数与跨原点标记（不落库，记录不存在返回 404，参数非法返回 422，无产物返回空数组） |
 | `POST` | `/gel-comparisons` | 只读比较 2~8 条已保存记录的凝胶条带：汇总片段长度按降序聚类（条带内 `(max-min)/max <= resolution_ratio`），返回条带长度范围、各泳道片段数、总碱基数与诊断条带（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-compatibility` | 只读枚举 2~8 条已保存记录之间可连接的片段末端对：黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，平端仅与平端兼容（可通过 `include_blunt` 关闭），返回按记录/片段/端方向稳定排序的配对、兼容类型、连接后突出端与总数（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-assembly` | 只读规划 2~8 条已保存记录之间的最长片段拼接链：复用末端反向互补兼容判定构建有向图，搜索不重复使用记录的最长线性链（每条记录最多贡献一个片段，可正向/反向摆入，`max_chain_length` 限制链上节点数），同长度方案按记录请求顺序、片段索引与端方向稳定择优，返回节点端点、连接类型/突出端、总连接数与未能延伸的原因（不落库，记录不存在返回 404，候选片段过多返回 422） |
@@ -474,6 +475,96 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
 - **结果顺序**：切口按 `(top_cut, bottom_cut)` 排序，片段按起点排序，酶名与
   位点列表均排序——**相同输入的结果顺序必然一致**。
 
+## PCR 扩增产物预测
+
+基于已保存记录的**原始序列与线性/环形拓扑**（**不依赖酶切片段**，即使记录没有
+任何切口也可使用），按请求给出的**正、反两条 IUPAC 引物**（均按 5'→3' 书写）
+预测 PCR 扩增产物。**预测过程不写库**：原记录保持不变，也不会产生新的提交。
+
+### 匹配与产物口径
+
+- **正引物**结合 top 链、沿模板**正向**（向右）延伸；**反引物**先取**反向互补**
+  再在 top 链上匹配、沿模板**反向**（向左）延伸。
+- 引物碱基与模板碱基的 **IUPAC 可能集合有交集**即匹配（如引物 `A` 可匹配模板
+  `R={A,G}`）；每条引物整个结合区允许**至多 1 处错配**，但各自 **3' 端最后两位
+  必须匹配**（该两位任意一处不兼容即整条结合不成立）。
+- 枚举正、反结合位点中**相向且结合区互不重叠**的位点对：
+  - **线性**：正结合区完整位于反结合区之前（`forward.start + 引物长 <= reverse.start`），
+    产物区间不得越出模板边界；
+  - **环形**：以正位点起点沿环向前到反位点起点的有向距离判定，允许产物**跨原点**
+    （`wraps_origin: true`），但长度**不得超过一圈**（即不超过模板长度）。
+- 长度超过 `max_product_length` 的产物不返回；产物按**起点、长度**去重并升序排列。
+
+### 请求
+
+以下示例假设 `id=1` 的记录为 28 bp 线性序列
+`ATGCGATCGCTTTTTTTTTTTTAGCTGC`（可先通过 `POST /digests` 创建；模板上无需任何
+酶切位点）：
+
+```bash
+curl -X POST http://localhost:8000/digests/1/pcr-products \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "forward_primer": "ATGCGATCGC",
+    "reverse_primer": "GCAGCTAA",
+    "max_product_length": 28
+  }'
+```
+
+- `forward_primer` / `reverse_primer`：5'→3' 书写的 IUPAC 引物，至少 **2** 个
+  碱基（大小写均可，按大写处理）；引物长于模板时不产生结合位点，结果为空数组。
+- `max_product_length`：最大产物长度（含），正整数，**不得超过模板长度**。
+
+### 响应
+
+反引物 `GCAGCTAA` 的反向互补为 `TTAGCTGC`，在位置 20 精确结合；正引物在位置 0
+精确结合，唯一产物覆盖 `[0, 28)`：
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "sequence_length": 28,
+  "forward_primer": "ATGCGATCGC",
+  "reverse_primer": "GCAGCTAA",
+  "max_product_length": 28,
+  "product_count": 1,
+  "products": [
+    {
+      "sequence": "ATGCGATCGCTTTTTTTTTTTTAGCTGC",
+      "start": 0,
+      "end": 28,
+      "length": 28,
+      "wraps_origin": false,
+      "forward_binding": {"start": 0, "end": 10, "mismatches": 0},
+      "reverse_binding": {"start": 20, "end": 28, "mismatches": 0}
+    }
+  ]
+}
+```
+
+- `products[]` 按（`start`, `length`）**升序、去重**返回：
+  - `sequence`：top 链 5'→3' 方向的产物序列（环形跨原点时拼接环首尾，长度恒为
+    一圈以内）；
+  - `start` / `end`：产物在 top 链上的 0-based 半开区间端点；环形产物跨原点时
+    `end` 为取模后的坐标（可能小于 `start`），`wraps_origin` 为 `true`；
+  - `length`：产物长度（含两端引物结合区）；
+  - `forward_binding` / `reverse_binding`：两端引物结合区（反引物坐标为其反向
+    互补序列在 top 链上的结合区）与各自错配数（恒为 0 或 1）。
+- **无产物时 `products` 为空数组 `[]`**（背向位点、越界、结合区重叠、引物过长、
+  全部位点均被 `max_product_length` 过滤等）。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| `max_product_length` 超过模板长度 | **422** |
+| `max_product_length` 小于 1 / 非整数 | **422** |
+| 引物为空或短于 2 个碱基 / 含非 IUPAC 字符 | **422** |
+| 缺少必填字段 | **422** |
+| 无符合条件的产物 | **200**，`products` 为 `[]` |
+
 ## 凝胶条带比较
 
 只读比较 **2~8 条已保存记录**的凝胶条带：把各记录（泳道）完整酶切结果的全部
@@ -862,6 +953,7 @@ app/
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
 ├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
 ├── methylation.py   # 甲基化阻断分析（敏感位点定位、切口保留/移除、片段重建）
+├── pcr.py        # PCR 扩增产物预测（IUPAC 引物匹配、错配/3'端规则、相向位点对枚举）
 ├── gel.py       # 凝胶条带比较（片段长度降序聚类、诊断条带标记）
 ├── ligation.py  # 末端连接兼容性分析（跨记录末端对枚举、黏端/平端兼容判定）
 ├── assembly.py  # 片段拼接链规划（有向图、不重复用记录的最长简单路径与稳定择优）
@@ -876,6 +968,7 @@ tests/
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试
 ├── test_methylation_api.py   # 甲基化阻断分析 API 测试
+├── test_pcr_api.py       # PCR 扩增产物预测 API 测试
 ├── test_gel_api.py       # 凝胶条带比较 API 测试
 ├── test_ligation_api.py  # 末端连接兼容性 API 测试
 ├── test_assembly_api.py  # 片段拼接链规划 API 测试
