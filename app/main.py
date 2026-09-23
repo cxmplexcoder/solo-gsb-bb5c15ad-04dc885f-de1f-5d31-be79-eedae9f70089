@@ -11,6 +11,11 @@
                                            状态并返回片段长度多重集的概率分布（只读，不落库）
     POST /digests/{id}/methylation-analysis 只读分析甲基化对已保存酶切位点的阻断影响，
                                            重算保留切口并重建片段（不落库）
+    POST /digests/{id}/pcr-products         只读 PCR 扩增产物预测：读取已保存记录的
+                                           原始序列与拓扑（不依赖酶切片段），按 IUPAC
+                                           交集匹配枚举相向、结合区不重叠的正/反引物
+                                           位点对（各允许一处错配、3' 端两位不得错配），
+                                           返回去重排序的产物（不落库）
     POST /gel-comparisons                只读比较 2~8 条已保存记录的凝胶条带：汇总片段
                                            长度按降序聚类，返回条带范围、各泳道片段数、
                                            总碱基数与诊断条带（不落库）
@@ -51,6 +56,7 @@ from .gel import compare_gel_lanes
 from .ligation import find_compatible_pairs
 from .methylation import analyze_methylation
 from .panel import plan_enzyme_panel
+from .pcr import TooManyBindingSitesError, predict_pcr_products
 from .schemas import (
     DigestRequest,
     DigestResponse,
@@ -70,6 +76,8 @@ from .schemas import (
     MethylationAnalysisResponse,
     PartialDigestDistributionResponse,
     PartialDigestRequest,
+    PcrProductsRequest,
+    PcrProductsResponse,
     VariantAnalysisRequest,
     VariantAnalysisResponse,
 )
@@ -358,9 +366,58 @@ def methylation_analysis(submission_id: int, request: MethylationAnalysisRequest
     }
 
 
+@app.post(
+    "/digests/{submission_id}/pcr-products",
+    response_model=PcrProductsResponse,
+)
+def pcr_products(submission_id: int, request: PcrProductsRequest) -> dict:
+    # 先确认记录存在：不存在返回 404，且不泄露任何校验细节
+    record = db.get_submission(submission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
+
+    length = len(record["sequence"])
+
+    # 最大产物长度依赖记录的模板长度，只能在取到记录后校验 -> 422
+    if request.max_product_length > length:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"max_product_length {request.max_product_length} exceeds template "
+                f"length {length}"
+            ),
+        )
+
+    # 仅在内存中枚举引物结合位点与相向位点对，只读取原始序列与拓扑，
+    # 不引用酶切片段，原记录与数据库均不改动
+    try:
+        products = predict_pcr_products(
+            record["sequence"],
+            record["topology"],
+            request.forward_primer,
+            request.reverse_primer,
+            request.max_product_length,
+        )
+    except TooManyBindingSitesError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{exc}; narrow primer degeneracy or use a longer primer",
+        ) from exc
+
+    return {
+        "id": record["id"],
+        "topology": record["topology"],
+        "sequence_length": length,
+        "forward_primer": request.forward_primer,
+        "reverse_primer": request.reverse_primer,
+        "max_product_length": request.max_product_length,
+        "product_count": len(products),
+        "products": products,
+    }
+
+
 @app.post("/gel-comparisons", response_model=GelComparisonResponse)
-def compare_gels(request: GelComparisonRequest) -> dict:
-    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+def compare_gels(request: GelComparisonRequest) -> dict:    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
     lanes = []
     for digest_id in request.digest_ids:
         record = db.get_submission(digest_id)

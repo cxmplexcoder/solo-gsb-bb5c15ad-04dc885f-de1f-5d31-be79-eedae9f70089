@@ -657,6 +657,82 @@ class LigationAssemblyResponse(BaseModel):
     stop_reason_detail: str
 
 
+# ---------- PCR 扩增产物预测 ----------
+
+
+class PcrProductsRequest(BaseModel):
+    """PCR 扩增产物预测请求：正/反两条 IUPAC 引物 + 最大产物长度。
+
+    纯只读计算，模板取自已保存记录的原始序列与拓扑，不引用酶切片段、
+    不写数据库。引物仅允许 IUPAC 碱基、至少 2 个碱基（3' 端最后两位
+    必须精确匹配，更短的引物无法应用该约束）；``max_product_length``
+    为正整数且不得超过模板长度，其上界依赖已保存记录的序列长度，
+    越界检查在路由中（取到记录之后）完成，以 422 拒绝。
+    """
+
+    forward_primer: str = Field(examples=["ATGAAA"])
+    reverse_primer: str = Field(examples=["TTCCCC"])
+    max_product_length: int = Field(
+        ge=1, description="产物长度上限（碱基），不得超过模板长度", examples=[100]
+    )
+
+    @field_validator("forward_primer", "reverse_primer")
+    @classmethod
+    def _primer_ok(cls, v: str) -> str:
+        v = _check_iupac(v, "primer")
+        if len(v) < 2:
+            raise ValueError("primer must be at least 2 bases long")
+        return v
+
+
+class PrimerBindingOut(BaseModel):
+    """一条引物在模板上的结合位点：锚点、结合区坐标、链方向与错配数。
+
+    ``strand`` 为 ``"+"``（正引物结合 top 链）或 ``"-"``（反引物以反向
+    互补序列结合 top 链）；``start`` / ``end`` 为 top 链 0-based 半开
+    区间，环形结合区跨原点时 ``end`` 可能小于 ``start``。
+    """
+
+    strand: Literal["+", "-"]
+    start: int
+    end: int
+    length: int
+    wraps_origin: bool
+    mismatches: int
+
+
+class PcrProductOut(BaseModel):
+    """一个 PCR 扩增产物。
+
+    ``start`` / ``end`` 为产物沿 top 链 5'->3' 的 0-based 半开区间端点；
+    环形产物跨原点时 ``end`` 为取模坐标（可能小于 ``start``），
+    ``wraps_origin`` 为真。``mismatches`` 为正、反引物结合位点的错配数
+    之和（每条引物至多 1，且 3' 端两位均精确匹配）。
+    """
+
+    start: int
+    end: int
+    length: int
+    sequence: str
+    wraps_origin: bool
+    forward_binding: PrimerBindingOut
+    reverse_binding: PrimerBindingOut
+    mismatches: int
+
+
+class PcrProductsResponse(BaseModel):
+    """PCR 产物预测结果：产物按 (start, length) 升序排列；无产物时为空数组。"""
+
+    id: int
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    forward_primer: str
+    reverse_primer: str
+    max_product_length: int
+    product_count: int
+    products: list[PcrProductOut]
+
+
 # ---------- 固定窗口 GC 含量范围 ----------
 
 

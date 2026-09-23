@@ -70,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
 | `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/methylation-analysis` | 只读分析甲基化对已保存酶切位点的阻断影响：按酶的敏感偏移定位甲基化碱基，阻断/保留/移除切口并重建片段（不落库，记录不存在返回 404） |
+| `POST` | `/digests/{id}/pcr-products` | 只读 PCR 扩增产物预测：读取已保存记录的**原始序列与线性/环形拓扑**（不依赖酶切片段），按 IUPAC 碱基集合交集匹配枚举相向、结合区不重叠的正/反引物位点对（各允许一处错配、3' 端最后两位不得错配），返回按起点与长度去重排序的产物序列、结合坐标、长度、错配数与跨原点标记（不落库，记录不存在返回 404，参数非法返回 422，无产物返回空数组） |
 | `POST` | `/gel-comparisons` | 只读比较 2~8 条已保存记录的凝胶条带：汇总片段长度按降序聚类（条带内 `(max-min)/max <= resolution_ratio`），返回条带长度范围、各泳道片段数、总碱基数与诊断条带（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-compatibility` | 只读枚举 2~8 条已保存记录之间可连接的片段末端对：黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，平端仅与平端兼容（可通过 `include_blunt` 关闭），返回按记录/片段/端方向稳定排序的配对、兼容类型、连接后突出端与总数（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-assembly` | 只读规划 2~8 条已保存记录之间的最长片段拼接链：复用末端反向互补兼容判定构建有向图，搜索不重复使用记录的最长线性链（每条记录最多贡献一个片段，可正向/反向摆入，`max_chain_length` 限制链上节点数），同长度方案按记录请求顺序、片段索引与端方向稳定择优，返回节点端点、连接类型/突出端、总连接数与未能延伸的原因（不落库，记录不存在返回 404，候选片段过多返回 422） |
@@ -838,6 +839,136 @@ curl -X POST http://localhost:8000/gc-content \
 | 序列为空，或含非 IUPAC 字符 | **422** |
 | `topology` 不是 `linear` / `circular` | **422** |
 
+## PCR 扩增产物预测
+
+对一次**已保存记录的原始序列与线性/环形拓扑**进行只读的 PCR 扩增产物预测：
+**不读取、不依赖任何酶切片段**，只使用提交时保存的模板序列本身。请求给出
+**正、反两条 IUPAC 引物**与**最大产物长度**，服务在模板上枚举两侧引物的结合
+位点并配对，返回全部可扩增产物。**预测过程不写库**：原记录保持不变，也不会
+产生新的提交。
+
+### 匹配规则
+
+- **正引物（forward）**：以引物原序列沿 top 链 **5'→3' 正向**匹配（结合于
+  top 链、向右延伸）；
+- **反引物（reverse）**：先取引物的**反向互补序列**，再沿 top 链 5'→3' 匹配
+  （即引物结合于 bottom 链、向左延伸）；
+- **IUPAC 简并匹配**：两个碱基的可能碱基集合**有交集即视为相容**
+  （复用全库统一口径，如模板 `R` 可与引物 `A` 相容）；
+- **错配额度**：每条引物允许**至多一处错配**（可能集合无交集计一个错配）；
+- **3' 端锚定**：每条引物 **3' 端最后两位不得错配**——该两位只要出现集合
+  无交集，整个位点直接拒绝，不占用错配额度。
+
+### 位点对与产物几何
+
+- 只枚举**相向**的位点对：正引物结合区在弧的上游、反引物结合区在弧的下游，
+  两条引物的延伸方向彼此指向；相背（divergent）的位点对不产生产物；
+- 两个**结合区不得重叠**；
+- **线性模板**：结合区必须完整落在分子内，产物不得越过分子端点；
+- **环形模板**：结合区可以**跨越原点**（锚点仍归一化到 `[0, L)`），产物弧也
+  可跨原点，但产物长度**不得超过一圈（`≤ L`）**；反引物结合区末端恰在正引物
+  锚点前闭合时，产物为整整一圈；
+- `max_product_length`：产物长度上限，正整数且**不超过模板长度**
+  （越界返回 422）；
+- 产物沿 top 链 5'→3' 自主引物 5' 锚点提取，环形跨原点时拼接首尾两段。
+
+### 请求
+
+以下示例假设 `id=1` 的记录序列为 `AAAATTTTCCCCGGGG`（线性，L=16；可先通过
+`POST /digests` 创建，酶列表与 PCR 预测无关）：
+
+```bash
+curl -X POST http://localhost:8000/digests/1/pcr-products \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "forward_primer": "AAAA",
+    "reverse_primer": "CCCC",
+    "max_product_length": 16
+  }'
+```
+
+- `forward_primer` / `reverse_primer`：仅允许 IUPAC 碱基
+  `ACGTRYSWKMBDHVN`（大小写均可，按大写处理），长度**至少 2**（3' 端锚定
+  规则需要最后两位）；
+- `max_product_length`：正整数，闭区间 **`[1, 模板长度]`**。
+
+### 响应
+
+上例中正引物 `AAAA` 精确锚于位置 0；反引物 `CCCC` 以反向互补 `GGGG` 锚于
+位置 12，产物覆盖位置 `[0, 16)`：
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "sequence_length": 16,
+  "forward_primer": "AAAA",
+  "reverse_primer": "CCCC",
+  "max_product_length": 16,
+  "product_count": 1,
+  "products": [
+    {
+      "start": 0,
+      "end": 16,
+      "length": 16,
+      "sequence": "AAAATTTTCCCCGGGG",
+      "wraps_origin": false,
+      "forward_binding": {
+        "strand": "+", "start": 0, "end": 4, "length": 4,
+        "wraps_origin": false, "mismatches": 0
+      },
+      "reverse_binding": {
+        "strand": "-", "start": 12, "end": 16, "length": 4,
+        "wraps_origin": false, "mismatches": 0
+      },
+      "mismatches": 0
+    }
+  ]
+}
+```
+
+- `products[].start` / `end`：产物沿 top 链 5'→3' 的 0-based **半开区间**
+  端点；环形产物跨原点时 `end = (start + length) mod L`，可能**小于**
+  `start`，此时 `wraps_origin` 为 `true`；
+- `length` / `sequence`：产物长度与序列（环形跨原点时为首尾拼接）；
+- `forward_binding` / `reverse_binding`：两端引物的结合位点，含
+  `strand`（正引物 `+`、反引物 `-`）、结合区 `start` / `end`（环形结合区
+  自身跨原点时 `end` 同样可能小于 `start`，并以自身的 `wraps_origin`
+  标记）、`length` 与该引物的 `mismatches`（0 或 1）；
+- `mismatches`：两条引物错配数之和（0、1 或 2）；
+- **去重与排序**：按产物 **`(start, length)`** 去重——同一产物可由多个位点
+  对扩增时，只保留**总错配数最少**的位点对；结果按 `(start, length)`
+  **升序**返回。没有任何合规位点对时 `products` 为**空数组** `[]`。
+
+环形示例（记录序列 `GGGGTTTTCCCCAAAA`，L=16）：正引物 `AAAA` 锚于 12、
+反引物 `CCCC`（`GGGG`）锚于 0，相向弧跨越原点，长度 8：
+
+```json
+{
+  "start": 12,
+  "end": 4,
+  "length": 8,
+  "sequence": "AAAAGGGG",
+  "wraps_origin": true,
+  "forward_binding": {"strand": "+", "start": 12, "end": 0, "length": 4,
+                      "wraps_origin": false, "mismatches": 0},
+  "reverse_binding": {"strand": "-", "start": 0, "end": 4, "length": 4,
+                      "wraps_origin": false, "mismatches": 0},
+  "mismatches": 0
+}
+```
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| `max_product_length` 超过模板长度 | **422** |
+| `max_product_length` 小于 1 / 非整数 / 字段缺失 | **422** |
+| 引物为空、不足 2 碱基，或含非 IUPAC 字符 | **422** |
+| 没有任何相向、结合区不重叠且满足错配/长度约束的位点对 | **200**，`products` 为 `[]` |
+| 单条引物候选结合位点超过 1000（高简并引物，枚举规模失控） | **422** |
+
 ## 行为规则
 
 - **双向搜索**：同时在 top 链搜索 `pattern` 与 `reverse_complement(pattern)`
@@ -866,6 +997,7 @@ app/
 ├── ligation.py  # 末端连接兼容性分析（跨记录末端对枚举、黏端/平端兼容判定）
 ├── assembly.py  # 片段拼接链规划（有向图、不重复用记录的最长简单路径与稳定择优）
 ├── gccontent.py # 固定窗口 GC 含量范围（简并碱基上下界、线性/环形滑窗）
+├── pcr.py       # PCR 扩增产物预测（IUPAC 错配匹配、相向位点对、线性/环形产物几何）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -879,7 +1011,8 @@ tests/
 ├── test_gel_api.py       # 凝胶条带比较 API 测试
 ├── test_ligation_api.py  # 末端连接兼容性 API 测试
 ├── test_assembly_api.py  # 片段拼接链规划 API 测试
-└── test_gc_content_api.py  # 固定窗口 GC 含量范围 API 测试
+├── test_gc_content_api.py  # 固定窗口 GC 含量范围 API 测试
+└── test_pcr_api.py        # PCR 扩增产物预测 API 与算法测试
 Dockerfile
 docker-compose.yml
 requirements.txt
